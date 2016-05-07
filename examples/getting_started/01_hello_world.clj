@@ -9,9 +9,9 @@
   (let [u (ui :stage
             :title "Hello World!"
             :shown true
+            :width 300
+            :height 250
             :scene (ui :scene
-                     :width 300
-                     :height 250
                      :root (ui :stack-pane
                              :children [(ui :button
                                           :text "Say 'Hello World'"
