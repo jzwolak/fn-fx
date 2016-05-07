@@ -59,7 +59,11 @@
           Deleted (delete-indexed-child! dom parent-node k idx node)
           Updated nil)))))
 
-(defn diff [dom a b]
+(defn diff
+  "Runs a diff on the ui specs a and b and creates an instance of the ui using dom to create the components.
+  Stores the UI instance in b as :dom-node. The create-component! method of the IDom implementation (dom) is
+  used to create the components."
+  [dom a b]
   (match [(val-type a) (val-type b)]
     [:nil :comp] (let [node (create-component! dom (:type b) (:props b))]
                    (assert node "No Node returned by create-component!")

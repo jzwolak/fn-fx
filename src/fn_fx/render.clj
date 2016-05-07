@@ -123,6 +123,8 @@
         (eval form)))))
 
 
+; this is never used. The only reference to it is inside a when-let and presumbably this statement is always false since
+; the body of the when-let requires *id-map* to be defined as a WeakHashMap and never is defined.
 (def ^:dynamic *id-map*)
 
 
@@ -292,11 +294,11 @@
 
 (def ignore-properties #{:type :fn-fx/children :fn-fx/id})
 
-(defn create-component [tp component]
+(defn create-component [tp spec]
   {:pre [(keyword? tp)]}
-  (let [builder (get-builder tp)
-        _       (assert builder (str "Can't find constructor for" tp (pr-str component)))
-        builder (builder)
+  (let [builder-factory (get-builder tp)
+        _       (assert builder-factory (str "Can't find constructor for" tp (pr-str spec)))
+        builder (builder-factory)
         setter  (get-builder-setter tp)
         synths (synthetic-properties tp)]
     (reduce-kv
@@ -306,17 +308,14 @@
                    (not (namespace k)))
           (setter builder k v)))
       nil
-      component)
-
-
+      spec)
     ;; Fill in default properties
     (reduce-kv
       (fn [_ k v]
-        (when-not (k component)
+        (when-not (k spec)
           (setter builder k (v))))
       nil
       (default-properties tp))
-
     (let [built        ((get-builder-build-fn tp) builder)
           built-setter (get-setter (@types tp))]
       (reduce-kv
@@ -324,9 +323,7 @@
           (when (contains? synths k)
             (built-setter built k v)))
         nil
-        component)
-
-
+        spec)
       (reduce-kv
         (fn [_ k v]
           (when (and (not (ignore-properties k))
@@ -335,12 +332,20 @@
               (assert tp (str "No static setter found for " (namespace k)))
               ((get-static-setter tp) built (name k) v))))
         nil
-        component)
-      (when-let [id (:fn-fx/id component)]
+        spec)
+      (when-let [id (:fn-fx/id spec)]
         (.put ^WeakHashMap *id-map* id built))
       built)))
 
-(defn ui [type & {:as props}]
+(defn ui
+  "Creates a virtual user interface node. This does not correspond to an actual JavaFX component but is instead used
+  to render a JavaFX component (or user defined component). You might refer to this as a user interface \"spec\"
+  and it includes the values from the application state. Everything needed to render the UI is returned by this
+  function. There is a field in the returned type instance to reference the JavaFX node. This field is set when
+  a diff is run and points to the actual UI components rendered from this spec. Note: JavaFX may be the UI toolkit
+  used, but this code is more generic and would work with other UI toolkits if a suitable IDom type is supplied to
+  the diff function."
+  [type & {:as props}]
   (let [props-col (children-properties (@types type))
         grouped (reduce-kv
                   (fn [acc k v]
