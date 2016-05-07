@@ -2,7 +2,7 @@
   (:import (javafx.embed.swing JFXPanel)
            (javax.swing JFrame)
            (javafx.application Application)
-           (javafx.scene Scene Node)
+           (javafx.scene Scene Node Group)
            (javafx.stage Stage)
            (javafx.util Builder)
            (java.lang.reflect Method Modifier)
@@ -13,15 +13,20 @@
            (org.reflections Reflections))
   (:require [fn-fx.util :as util]
             [fn-fx.diff :as diff]
-            [clojure.string :as string]))
+            [clojure.string :as string]
+            [clojure.string :as str]))
 
 (set! *warn-on-reflection* true)
 
 (JFXPanel.)
 
-(def constructors (atom {}))
+(def builders
+  "A map of keyword kabobbed type names to builder class instances (Class<*Builder>) for the type."
+  (atom {}))
 (def types (atom {}))
 (def types->kw (atom {}))
+(def default-constructor-arg
+  {:scene [`(new Group)]})
 
 (def ^:dynamic *log* false)
 
@@ -30,14 +35,19 @@
     (println form)))
 
 (defn scan-all []
-  (let [ref      (Reflections. "javafx" nil)
-        builders (.getSubTypesOf ref Builder)]
-    (vec (for [^Class builder builders
-               :when (not (.startsWith (.getName builder)
-                                       "javafx.fxml."))]
-           (Class/forName (subs (.getName builder) 0
-                                (- (count (.getName builder))
-                                   (count "Builder"))))))))
+  (let [ref (Reflections. "javafx" nil)
+        builders (concat (.getSubTypesOf ref Node)
+                         [(Class/forName "javafx.scene.Scene")]
+                         (.getSubTypesOf ref (Class/forName "javafx.stage.Window")))]
+    (filter
+      (fn [k] (not (Modifier/isAbstract (.getModifiers k))))
+      builders)
+    #_(vec (for [^Class builder builders
+                 :when (not (.startsWith (.getName builder)
+                                         "javafx.fxml."))]
+             (Class/forName (subs (.getName builder) 0
+                                  (- (count (.getName builder))
+                                     (count ""))))))))
 
 
 (declare create-component)
@@ -53,18 +63,19 @@
 
 (defn import-components [components]
   (doseq [component components]
-    (let [component    (if (instance? Class component)
-                         (symbol (.getName ^Class component))
-                         component)
-          klass        (Class/forName (name component))
-          builder-name (symbol (str (name component) "Builder"))
-          kw-name      (->> (.lastIndexOf (name component) ".")
-                            inc
-                            (subs (name component))
-                            util/camel->kabob
-                            keyword)]
+    (let [component (if (instance? Class component)
+                      (symbol (.getName ^Class component))
+                      component)
+          klass (Class/forName (name component))
+          builder-name (symbol (str (name component) ""))
+          kw-name (->> (.lastIndexOf (name component) ".")
+                       inc
+                       (subs (name component))
+                       util/camel->kabob
+                       keyword)]
       (swap! converter-code conj [klass identity])
-      (swap! constructors assoc kw-name (Class/forName (name builder-name)))
+      (println "storing builder:" builder-name)
+      (swap! builders assoc kw-name (Class/forName (name builder-name)))
       (swap! types assoc kw-name klass)
       (swap! types->kw assoc klass kw-name))))
 
@@ -90,14 +101,14 @@
              (let [clauses (mapcat
                              (fn [o]
                                `[~(keyword (string/replace (.toLowerCase ^String (str o))
-                                             #"\_" "-"))
+                                                           #"\_" "-"))
                                  ~(symbol (.getName to-tp) (str o))])
                              (.getEnumConstants to-tp))
                    fn-name (symbol (str "-enum-converter-" (munge (.getName to-tp))))
-                   form    `(fn ~fn-name [v#]
-                              (case v#
-                                ~@clauses
-                                :else (assert false (str "Bad enum value " v#))))]
+                   form `(fn ~fn-name [v#]
+                           (case v#
+                             ~@clauses
+                             :else (assert false (str "Bad enum value " v#))))]
                (log form)
                (eval form)))))
 
@@ -116,10 +127,12 @@
 (def get-builder
   (memoize
     (fn [nm]
-      (let [ctor (@constructors nm)
-            _    (assert ctor (str "No constructor for " (pr-str nm)))
-            form `(fn [] (. ~(@constructors nm) create))]
+      (println "creating" (@builders nm))
+      (let [ctor (@builders nm)
+            _ (assert ctor (str "No constructor for " (pr-str nm)))
+            form `(fn [] (new ~(@builders nm) ~@(default-constructor-arg nm)))]
         (log form)
+        (println form)
         (eval form)))))
 
 
@@ -131,30 +144,37 @@
 (def get-builder-setter
   (memoize
     (fn [tp]
-      (let [^Class ctor (@constructors tp)
+      (println "creating setters for" tp)
+      (let [^Class ctor (@builders tp)
             builder-sym (with-meta (gensym "builder")
                                    {:tag (symbol (.getName ctor))})
-            val-sym     (gensym "val")
-            clauses     (for [m (.getMethods ctor)
-                              :when (Modifier/isPublic (.getModifiers ^Method m))
-                              :when (not (Modifier/isStatic (.getModifiers ^Method m)))
-                              :when (not (Modifier/isVolatile (.getModifiers ^Method m)))
-                              :when (= (.getParameterCount ^Method m) 1)
-                              :when (not (#{"applyTo"} (.getName ^Method m)))
-                              :let [arg-type (aget (.getParameterTypes ^Method m) 0)]
-                              :let [converter (get-converter arg-type)]
-                              :when converter]
-                          `[~(keyword (util/camel->kabob (.getName ^Method m)))
-                            (. ~builder-sym
-                               ~(symbol (.getName ^Method m))
-                               ~(with-meta `(~converter ~val-sym)
-                                           {:tag arg-type}))])
-            form        `(fn [~builder-sym property# ~val-sym]
-                           (case property#
-                             ~@(apply concat clauses)
-                             (println "Unknown builder property" property# "on" ~tp)
-                             #_(assert false (str "Unknown property" {:property-name property#}))))]
+            val-sym (gensym "val")
+            clauses (for [m (.getMethods ctor)
+                          :when (Modifier/isPublic (.getModifiers ^Method m))
+                          :when (not (Modifier/isStatic (.getModifiers ^Method m)))
+                          :when (not (Modifier/isVolatile (.getModifiers ^Method m)))
+                          :when (= (.getParameterCount ^Method m) 1)
+                          :when (not (#{"applyTo"} (.getName ^Method m)))
+                          :when (or (re-matches #"^set[A-Z].*" (.getName ^Method m)) (re-matches #"^on[A-Z].*" (.getName ^Method m)))
+                          :let [arg-type (aget (.getParameterTypes ^Method m) 0)]
+                          :let [converter (get-converter arg-type)]
+                          :when converter]
+                      (let [kw-method-name (keyword (util/camel->kabob (str/replace (.getName ^Method m) #"^set([A-Z])" "$1")))
+                            method-name (.getName ^Method m)]
+                        #_(println "    " kw-method-name "->" method-name)
+                        `[~kw-method-name
+                          (. ~builder-sym
+                             ~(symbol method-name)
+                             ~(with-meta `(~converter ~val-sym)
+                                         {:tag arg-type}))]))
+            form `(fn [~builder-sym property# ~val-sym]
+                    (case property#
+                      ~@(apply concat clauses)
+                      (println "Unknown property" property# "on" ~tp)
+                      #_(assert false (str "Unknown property" {:property-name property#}))))]
         (log form)
+        #_(println "in setter creator")
+        #_(println form)
         (eval form)))))
 
 (def primitive-properties #{Integer Long Double Float String BigDecimal BigInteger
@@ -168,7 +188,7 @@
                  :let [arg-type (.getReturnType ^Method m)]
                  :let [converter (get-converter arg-type)]
                  :when (and (not (primitive-properties arg-type))
-                         (not (.isEnum arg-type)))
+                            (not (.isEnum arg-type)))
                  :let [prop-name (let [mn (subs (.getName ^Method m) 3)]
                                    (str (.toLowerCase (subs mn 0 1)) (subs mn 1)))]
                  :when converter]
@@ -181,30 +201,30 @@
     (fn [tp]
       (assert tp)
       (let [^Class tp tp
-            obj-sym   (with-meta (gensym "obj")
-                                 {:tag (symbol (.getName tp))})
-            val-sym   (gensym "val")
-            clauses   (for [m (.getMethods tp)
-                            :when (= (.getParameterCount ^Method m) 1)
-                            :when (.startsWith (.getName ^Method m) "set")
-                            :let [arg-type (aget (.getParameterTypes ^Method m) 0)]
-                            :let [converter (get-converter arg-type)]
-                            :let [prop-name (let [mn (subs (.getName ^Method m) 3)]
-                                              (str (.toLowerCase (subs mn 0 1)) (subs mn 1)))]
-                            :when converter]
-                        `[~(keyword prop-name)
-                          (. ~obj-sym
-                             ~(symbol (.getName ^Method m))
-                             ~(with-meta `(~converter ~val-sym)
-                                         {:tag arg-type}))])
+            obj-sym (with-meta (gensym "obj")
+                               {:tag (symbol (.getName tp))})
+            val-sym (gensym "val")
+            clauses (for [m (.getMethods tp)
+                          :when (= (.getParameterCount ^Method m) 1)
+                          :when (.startsWith (.getName ^Method m) "set")
+                          :let [arg-type (aget (.getParameterTypes ^Method m) 0)]
+                          :let [converter (get-converter arg-type)]
+                          :let [prop-name (let [mn (subs (.getName ^Method m) 3)]
+                                            (str (.toLowerCase (subs mn 0 1)) (subs mn 1)))]
+                          :when converter]
+                      `[~(keyword prop-name)
+                        (. ~obj-sym
+                           ~(symbol (.getName ^Method m))
+                           ~(with-meta `(~converter ~val-sym)
+                                       {:tag arg-type}))])
 
-            form      `(fn [~obj-sym property# ~val-sym]
-                         (case property#
-                           ~@(apply concat clauses)
-                           (let [syn# (get-in synthetic-properties [(@types->kw ~tp) property# :set])]
-                             (if syn#
-                               (syn# ~obj-sym property# ~val-sym)
-                               (println "Unknown setter property" property# " on " ~tp)))))]
+            form `(fn [~obj-sym property# ~val-sym]
+                    (case property#
+                      ~@(apply concat clauses)
+                      (let [syn# (get-in synthetic-properties [(@types->kw ~tp) property# :set])]
+                        (if syn#
+                          (syn# ~obj-sym property# ~val-sym)
+                          (println "Unknown setter property" property# " on " ~tp)))))]
 
         (log form)
         (eval form)))))
@@ -215,29 +235,29 @@
       (assert tp)
       (let [^Class tp tp
             child-sym (gensym "child")
-            val-sym   (gensym "val")
-            clauses   (for [m (.getMethods tp)
-                            :when (Modifier/isStatic (.getModifiers ^Method m))
-                            :when (= (.getParameterCount ^Method m) 2)
-                            :when (.startsWith (.getName ^Method m) "set")
-                            :let [arg-type0 (aget (.getParameterTypes ^Method m) 0)
-                                  arg-type1 (aget (.getParameterTypes ^Method m) 1)
-                                  converter (get-converter arg-type1)
-                                  prop-name (let [mn (subs (.getName ^Method m) 3)]
-                                              (util/camel->kabob (str (.toLowerCase (subs mn 0 1)) (subs mn 1))))]
-                            :when converter]
-                        `[~prop-name
-                          (~(symbol (.getName tp)
-                                    (.getName ^Method m))
-                            ~(with-meta child-sym
-                                        {:tag arg-type0})
-                            ~(with-meta `(~converter ~val-sym)
-                                        {:tag arg-type1}))])
+            val-sym (gensym "val")
+            clauses (for [m (.getMethods tp)
+                          :when (Modifier/isStatic (.getModifiers ^Method m))
+                          :when (= (.getParameterCount ^Method m) 2)
+                          :when (.startsWith (.getName ^Method m) "set")
+                          :let [arg-type0 (aget (.getParameterTypes ^Method m) 0)
+                                arg-type1 (aget (.getParameterTypes ^Method m) 1)
+                                converter (get-converter arg-type1)
+                                prop-name (let [mn (subs (.getName ^Method m) 3)]
+                                            (util/camel->kabob (str (.toLowerCase (subs mn 0 1)) (subs mn 1))))]
+                          :when converter]
+                      `[~prop-name
+                        (~(symbol (.getName tp)
+                                  (.getName ^Method m))
+                          ~(with-meta child-sym
+                                      {:tag arg-type0})
+                          ~(with-meta `(~converter ~val-sym)
+                                      {:tag arg-type1}))])
 
-            form      `(fn [~child-sym property# ~val-sym]
-                         (case (name property#)
-                           ~@(apply concat clauses)
-                           (println "Unknown static property" property# "on" ~tp)))]
+            form `(fn [~child-sym property# ~val-sym]
+                    (case (name property#)
+                      ~@(apply concat clauses)
+                      (println "Unknown static property" property# "on" ~tp)))]
 
         (log form)
         (eval form)))))
@@ -246,21 +266,21 @@
   (memoize
     (fn [tp]
       (let [^Class tp tp
-            obj-sym   (with-meta (gensym "obj")
-                                 {:tag (symbol (.getName tp))})
-            clauses   (for [m (.getMethods tp)
-                            :when (= (.getParameterCount ^Method m) 0)
-                            :when (.startsWith (.getName ^Method m) "get")
-                            :when (not (contains? #{"getClass"} (.getName ^Method m)))
-                            :let [prop-name (let [mn (subs (.getName ^Method m) 3)]
-                                              (str (.toLowerCase (subs mn 0 1)) (subs mn 1)))]]
-                        `[~(keyword prop-name)
-                          (. ~obj-sym
-                             ~(symbol (.getName ^Method m)))])
-            form      `(fn [~obj-sym property#]
-                         (case property#
-                           ~@(apply concat clauses)
-                           (println "Unknown property" property#)))]
+            obj-sym (with-meta (gensym "obj")
+                               {:tag (symbol (.getName tp))})
+            clauses (for [m (.getMethods tp)
+                          :when (= (.getParameterCount ^Method m) 0)
+                          :when (.startsWith (.getName ^Method m) "get")
+                          :when (not (contains? #{"getClass"} (.getName ^Method m)))
+                          :let [prop-name (let [mn (subs (.getName ^Method m) 3)]
+                                            (str (.toLowerCase (subs mn 0 1)) (subs mn 1)))]]
+                      `[~(keyword prop-name)
+                        (. ~obj-sym
+                           ~(symbol (.getName ^Method m)))])
+            form `(fn [~obj-sym property#]
+                    (case property#
+                      ~@(apply concat clauses)
+                      (println "Unknown property" property#)))]
         (log form)
         (eval form)))))
 
@@ -278,11 +298,11 @@
 (def get-builder-build-fn
   (memoize
     (fn [tp]
-      (let [^Class ctor (@constructors tp)
+      (let [^Class ctor (@builders tp)
             builder-sym (with-meta (gensym "builder")
                                    {:tag (symbol (.getName ctor))})
-            form        `(fn [~builder-sym]
-                           (.build ~builder-sym))]
+            form `(fn [~builder-sym]
+                    (.build ~builder-sym))]
         (log form)
         (eval form)))))
 
@@ -297,9 +317,16 @@
 (defn create-component [tp spec]
   {:pre [(keyword? tp)]}
   (let [builder-factory (get-builder tp)
-        _       (assert builder-factory (str "Can't find constructor for" tp (pr-str spec)))
+        klass-name (util/kabob->class tp)
+        _ (println "class name as string:" klass-name)
+        ;klass   (Class/forName klass-name)
+        ;_       (println "class:" klass)
+        ;component (.newInstance klass)
+        ;_       (println "object:" component)
+        _ (assert builder-factory (str "Can't find constructor for" tp (pr-str spec)))
         builder (builder-factory)
-        setter  (get-builder-setter tp)
+        _ (println "got \"builder\":" builder)
+        setter (get-builder-setter tp)
         synths (synthetic-properties tp)]
     (reduce-kv
       (fn [_ k v]
@@ -316,7 +343,7 @@
           (setter builder k (v))))
       nil
       (default-properties tp))
-    (let [built        ((get-builder-build-fn tp) builder)
+    (let [built builder #_((get-builder-build-fn tp) builder)
           built-setter (get-setter (@types tp))]
       (reduce-kv
         (fn [_ k v]
@@ -346,6 +373,7 @@
   used, but this code is more generic and would work with other UI toolkits if a suitable IDom type is supplied to
   the diff function."
   [type & {:as props}]
+  (println "ui:" type "resolved:" (@types type))
   (let [props-col (children-properties (@types type))
         grouped (reduce-kv
                   (fn [acc k v]
